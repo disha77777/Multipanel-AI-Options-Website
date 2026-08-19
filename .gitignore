@@ -2,3 +2,4 @@
 /.qodo
 /ATTRIBUTIONS.md
 /vite.config.ts
+node_modules
