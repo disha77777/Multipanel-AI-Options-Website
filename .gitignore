@@ -1,5 +1,20 @@
-/.DS_Store
-/.qodo
-/ATTRIBUTIONS.md
-/vite.config.ts
-node_modules
+# Secrets
+key.env
+.env
+
+# Python environment
+.venv/
+
+# Local editor/project files
+.vscode/
+.qodo/
+
+# Generated output
+*.xlsx
+*.pptx
+ai_chart.png
+ocr_output.csv
+
+# Python cache
+__pycache__/
+*.pyc
