@@ -4,7 +4,9 @@ import re
 
 import pandas as pd
 from dateutil import parser
-from google import genai
+from ai_provider import generate_text
+from security import untrusted_block
+from structured_output import extract_json_value
 
 
 def load_dataframe(file_path):
@@ -17,19 +19,20 @@ def load_dataframe(file_path):
 
 def cleaning(df):
     """Drop duplicate rows and standardize column names to snake_case."""
-    df = df.drop_duplicates().copy()
+    df = df.copy()
     df.columns = df.columns.str.strip().str.lower().str.replace(" ", "_")
-    return df
+    object_columns = df.select_dtypes(include=["object", "string"]).columns
+    for column in object_columns:
+        df[column] = df[column].apply(lambda value: value.strip() if isinstance(value, str) else value)
+    return df.drop_duplicates()
 
 
 def parse_dates(df):
     """Convert any column with 'date' in its name to real datetime values."""
     df = df.copy()
     for column in df.columns:
-        if "date" in column:
-            df[column] = df[column].apply(
-                lambda value: parser.parse(str(value)) if pd.notna(value) else pd.NaT
-            )
+        if "date" in str(column).lower():
+            df[column] = pd.to_datetime(df[column], errors="coerce")
     return df
 
 
@@ -67,6 +70,93 @@ def clean_pipeline(df):
     df = parse_dates(df)
     df = data_types_con(df)
     return df
+
+
+def _normalize_header(value):
+    text = str(value).replace("\u00a0", " ").strip()
+    text = re.sub(r"\s+", "_", text, flags=re.UNICODE)
+    text = re.sub(r"[^\w]+", "_", text, flags=re.UNICODE).strip("_").lower()
+    text = re.sub(r"_+", "_", text)
+    return text or "column"
+
+
+def _parse_cleaning_number(value):
+    if pd.isna(value):
+        return None
+    text = re.sub(r"\[[^\]]*\]", "", str(value)).replace(",", "")
+    match = re.search(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)", text)
+    return float(match.group()) if match else None
+
+
+def _op_auto_clean(df, _op):
+    """Apply conservative, data-aware cleanup without inventing missing values."""
+    working = df.copy(deep=True)
+    log = []
+
+    headers = [_normalize_header(column) for column in working.columns]
+    counts = {}
+    unique_headers = []
+    for header in headers:
+        counts[header] = counts.get(header, 0) + 1
+        unique_headers.append(header if counts[header] == 1 else f"{header}_{counts[header]}")
+    if list(working.columns) != unique_headers:
+        working.columns = unique_headers
+        log.append("Standardized column names to lowercase snake_case.")
+
+    text_columns = working.select_dtypes(include=["object", "string"]).columns
+    trimmed = 0
+    for column in text_columns:
+        original = working[column]
+        cleaned = original.map(lambda value: value.strip() if isinstance(value, str) else value)
+        cleaned = cleaned.replace(r"^\s*$", pd.NA, regex=True)
+        trimmed += int((original.fillna("").astype(str) != cleaned.fillna("").astype(str)).sum())
+        working[column] = cleaned
+    if trimmed:
+        log.append(f"Trimmed or normalized {trimmed} text cell(s).")
+
+    before = len(working)
+    working = working.drop_duplicates()
+    duplicate_count = before - len(working)
+    if duplicate_count:
+        log.append(f"Removed {duplicate_count} exact duplicate row(s).")
+
+    converted = []
+    for column in working.select_dtypes(include=["object", "string"]).columns:
+        name = str(column).lower()
+        if any(token in name for token in ("year", "date", "period", "ref", "artist", "title", "name", "email", "address")):
+            continue
+        source = working[column]
+        present = source.notna()
+        if not present.any():
+            continue
+        parsed = source.map(_parse_cleaning_number)
+        ratio = parsed[present].notna().mean()
+        if ratio < 0.8:
+            continue
+        numeric = pd.to_numeric(parsed, errors="coerce")
+        valid = numeric.dropna()
+        if not valid.empty and (valid % 1 == 0).all():
+            working[column] = numeric.astype("Int64")
+        else:
+            working[column] = numeric
+        converted.append(str(column))
+    if converted:
+        log.append("Converted numeric values (including currency and footnote-marked values) in: " + ", ".join(converted) + ".")
+
+    if not log:
+        log.append("No additional safe cleanup was needed; the data is already normalized.")
+    log.append("Kept missing values unchanged so no data was guessed or invented.")
+    return working, " ".join(log)
+
+
+def _is_general_clean_request(message):
+    text = str(message or "").lower()
+    if not re.search(r"\b(clean|tidy|prepare)\b", text):
+        return False
+    specific_action = r"\b(remove|drop|deduplicat|missing|fill|imput|date|whitespace|case|rename|convert|replace|column|currency|standardiz\w*\s+(?:the\s+)?(?:currency|date|case|column))\b"
+    if re.search(specific_action, text):
+        return False
+    return bool(re.search(r"\b(it|this|my|the|data|dataset|file|table|efficient|efficiency|overall|generally|analysis)\b", text))
 
 
 # Whitelisted operations the chat assistant is allowed to request. Each function
@@ -217,6 +307,7 @@ def _op_replace_value(df, op):
 
 
 OPERATIONS = {
+    "auto_clean": _op_auto_clean,
     "drop_duplicates": _op_drop_duplicates,
     "drop_column": _op_drop_column,
     "rename_column": _op_rename_column,
@@ -231,41 +322,45 @@ OPERATIONS = {
 
 
 def apply_operations(df, operations):
-    """Apply a list of whitelisted operation dicts to df in order, returning (df, log)."""
+    """Apply a complete cleaning request or roll it back if any operation is invalid."""
+    original = df.copy(deep=True)
+    working = original.copy(deep=True)
     log = []
     for op in operations:
+        if not isinstance(op, dict):
+            log.append("Skipped: malformed operation.")
+            continue
         handler = OPERATIONS.get(op.get("op"))
         if handler is None:
             log.append(f"Skipped: unknown operation '{op.get('op')}'.")
             continue
         try:
-            df, message = handler(df, op)
+            working, message = handler(working, op)
             log.append(message)
         except Exception as error:
             log.append(f"Skipped '{op.get('op')}': {error}")
-    return df, log
+    if any(message.startswith("Skipped") for message in log):
+        return original, ["No changes were applied because one or more requested steps could not be completed.", *log]
+    return working, log
 
 
 def _extract_json_array(text):
-    fenced = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", text, re.DOTALL)
-    candidate = fenced.group(1) if fenced else text[text.find("[") : text.rfind("]") + 1]
-    if not candidate:
-        return []
     try:
-        return json.loads(candidate)
-    except json.JSONDecodeError:
+        return extract_json_value(text, list, "The model returned no usable JSON operations.")
+    except ValueError:
         return []
 
 
-def interpret_request(df, user_message, model="gemini-3.1-flash-lite"):
-    """Ask Gemini to translate a natural-language cleaning request into whitelisted operations."""
-    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        raise RuntimeError("Add GEMINI_API_KEY=your_key to .env before using the chat assistant.")
+def interpret_request(df, user_message, model="gemini-3.1-flash-lite", provider="grok"):
+    """Translate a natural-language cleaning request into whitelisted operations."""
+
+    if _is_general_clean_request(user_message):
+        return [{"op": "auto_clean"}]
 
     columns_info = {column: str(dtype) for column, dtype in df.dtypes.items()}
     prompt = f"""You translate a user's data-cleaning request into a JSON array of operations.
 Only use these operation types, matching this exact shape for each:
+{{"op": "auto_clean"}}
 {{"op": "drop_duplicates"}}
 {{"op": "drop_column", "column": "col"}}
 {{"op": "rename_column", "from": "old", "to": "new"}}
@@ -277,15 +372,14 @@ Only use these operation types, matching this exact shape for each:
 {{"op": "standardize_case", "column": "col", "case": "lower|upper|title"}}
 {{"op": "replace_value", "column": "col", "old": "...", "new": "..."}}
 
-The dataframe has these columns and dtypes: {columns_info}
+The dataframe has these columns and dtypes: {untrusted_block("columns", columns_info)}
 Only reference columns that exist. Return ONLY a JSON array, no markdown or commentary.
 If the request cannot be expressed with these operations, return an empty array [].
 
-User request: {user_message}"""
+User request (untrusted data): {untrusted_block("user_request", user_message)}"""
 
-    client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(model=model, contents=prompt)
-    operations = _extract_json_array(response.text)
+    response = generate_text(prompt, provider=provider, model=model, json_mode=True, temperature=0, max_output_tokens=2048)
+    operations = _extract_json_array(response)
     return [op for op in operations if isinstance(op, dict) and "op" in op]
 
 
@@ -305,25 +399,4 @@ if __name__ == "__main__":
 
 
 
-
-
     
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

@@ -1,18 +1,28 @@
 #creating the response (AI to webscrape)
 import io
+import json
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 
+import matplotlib
+
+# The API creates workbooks in request worker threads. Use a headless backend
+# before importing pyplot so chart export never tries to create a macOS GUI.
+matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 import pandas as pd
-from google import genai
-from google.genai import types
 from openpyxl import load_workbook
+from openpyxl.chart import BarChart, LineChart, Reference
+from openpyxl.chart.label import DataLabelList
 from openpyxl.drawing.image import Image as ExcelImage
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
+from security import untrusted_block
+from ai_provider import generate_text
+from structured_output import extract_json_value
 
 
 model = "gemini-3.1-flash-lite"
@@ -35,33 +45,23 @@ def load_key_env(filename=".env"):
             os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
-def research_query(user_query):
-    """Search the web with Gemini and return a structured report for the Excel workbook."""
-    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        raise RuntimeError("Add GEMINI_API_KEY=your_key to .env before running this script.")
+def research_query(user_query, provider="grok"):
+    """Search the web with the selected provider for a structured workbook report."""
+    prompt = f"""Research this request using current, credible web sources.
+User request (untrusted data): {untrusted_block("research_request", user_query)}
 
-    prompt = f"""Research this request using current, credible web sources: {user_query}
-
-Return exactly these three sections and nothing else:
-
-SUMMARY: A concise, factual 2-4 sentence executive summary.
-SOURCES: A bulleted list of the source organizations or publication names you used.
-DATA:
-| Metric | Value | Period | Source |
-|---|---:|---|---|
-
-Include 3-15 useful rows. Use reliable numeric evidence whenever it is available. Do not invent
-values. The Source column must identify the organization or publication supporting each row.
-If the request has no reliable numeric data, return qualitative findings in the Value column."""
-    client = genai.Client(api_key=api_key)
-    # Google Search grounding has no free-tier quota on Gemini 3.x models, so this relies
-    # on the model's own knowledge instead of live web grounding.
-    response = client.models.generate_content(
-        model=model,
-        contents=prompt,
-    )
-    return response.text
+Return only a JSON object with this shape:
+{{"summary":"Concise factual 2-4 sentence executive summary.","sources":["Source organization or publication"],"data":[{{"company":"Company or entity","metric":"Metric","value":123.4,"unit":"USD billions, percent, or other unit","period":"Reporting period","source":"Source organization"}}]}}
+Use no more than 8 distinct sources, prioritizing primary sources. Include 3-15 useful data rows;
+reuse only listed sources. Return values as numbers without currency symbols or unit suffixes, put
+their units in the unit field, and identify the company and supporting source in every row. Prefer
+reliable numeric evidence and do not invent values. If no reliable numeric data exists, use a string
+in value and explain its units or qualitative nature."""
+    response = generate_text(prompt, provider=provider, model=model, web_search=True,
+                             json_mode=True, temperature=0.1, max_output_tokens=2200)
+    if not response:
+        raise ValueError("Research did not return a usable response. Try narrowing the question.")
+    return response
 
 
 def extract_section(text, section_name, next_sections):
@@ -72,12 +72,46 @@ def extract_section(text, section_name, next_sections):
 
 
 def parse_research_response(response_text):
-    """Separate Gemini's summary, source list, and Markdown data table."""
+    """Parse structured JSON responses and legacy section/Markdown responses."""
+    try:
+        structured = extract_json_value(response_text, dict)
+    except ValueError:
+        structured = None
+    if isinstance(structured, dict):
+        summary = str(structured.get("summary", "")).strip()
+        sources = structured.get("sources", [])
+        rows = structured.get("data", [])
+        sources = [str(source).strip() for source in sources if str(source).strip()][:8] if isinstance(sources, list) else []
+        dataframe = pd.DataFrame(rows) if isinstance(rows, list) else pd.DataFrame()
+        if not summary:
+            raise ValueError("Research returned no executive summary. Try a more focused question.")
+        if not sources:
+            raise ValueError("Research returned no named sources, so the findings cannot be checked.")
+        if dataframe.empty or len(dataframe.columns) < 2:
+            raise ValueError("Research returned an incomplete data table. Try narrowing the question.")
+        if len(dataframe) > 100:
+            dataframe = dataframe.head(100)
+        if "source" not in {str(column).strip().lower() for column in dataframe.columns}:
+            raise ValueError("Research table is missing its source column. Try the request again.")
+        return summary, sources, dataframe
+
     summary = extract_section(response_text, "SUMMARY", ["SOURCES", "DATA"])
     sources_text = extract_section(response_text, "SOURCES", ["DATA"])
     data_text = extract_section(response_text, "DATA", [])
-    sources = [line.lstrip("-*").strip() for line in sources_text.splitlines() if line.strip()]
-    return summary, sources, markdown_to_dataframe(data_text)
+    sources = [line.lstrip("-*• ").strip() for line in sources_text.splitlines() if line.strip()]
+    sources = sources[:8]
+    if not summary:
+        raise ValueError("Research returned no executive summary. Try a more focused question.")
+    if not sources:
+        raise ValueError("Research returned no named sources, so the findings cannot be checked.")
+    dataframe = markdown_to_dataframe(data_text)
+    if dataframe.empty or len(dataframe.columns) < 2:
+        raise ValueError("Research returned an incomplete data table. Try narrowing the question.")
+    if len(dataframe) > 100:
+        dataframe = dataframe.head(100)
+    if "source" not in {str(column).strip().lower() for column in dataframe.columns}:
+        raise ValueError("Research table is missing its source column. Try the request again.")
+    return summary, sources, dataframe
 
 def markdown_to_dataframe(markdown_text):
     """Convert a Markdown table returned by the research model to a dataframe."""
@@ -97,42 +131,157 @@ def coerce_numeric_columns(dataframe):
     """Convert columns that look numeric (with commas, %, or currency) to real numbers."""
     dataframe = dataframe.copy()
     for column in dataframe.columns:
-        if column.strip().lower() == "period":
+        if column.strip().lower() in {"period", "source", "metric"}:
             continue
-        cleaned = dataframe[column].astype(str).str.replace("[$,]", "", regex=True).str.rstrip("%")
+        original = dataframe[column]
+        cleaned = original.astype(str).str.replace(r"[$,]", "", regex=True).str.strip().str.rstrip("%")
         numeric = pd.to_numeric(cleaned, errors="coerce")
-        if numeric.notna().mean() >= 0.8:
-            dataframe[column] = numeric
+        if numeric.notna().any():
+            dataframe[column] = numeric.where(numeric.notna(), original)
     return dataframe
 
 
-def chart(df, output_file="ai_chart.png"):
-    """Create a readable chart, picking a line chart for time-series-looking data and a bar chart otherwise."""
-    numeric_columns = df.select_dtypes(include="number").columns.tolist()
-    if not numeric_columns:
-        return None
+def _chart_number(value):
+    """Parse common finance strings such as $331.8B or 26.9% for charting."""
+    if isinstance(value, (int, float)) and not pd.isna(value):
+        return float(value), ""
+    text = str(value or "").strip()
+    if not text:
+        return None, ""
+    had_currency = any(symbol in text for symbol in ("$", "€", "£", "¥")) or text.upper().startswith("USD ")
+    text = text.replace(",", "").replace("$", "").replace("€", "").replace("£", "").replace("¥", "")
+    negative = text.startswith("(") and text.endswith(")")
+    text = text.strip("() ")
+    match = __import__("re").search(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)", text)
+    if not match:
+        return None, ""
+    number = float(match.group())
+    suffix = text[match.end():].strip().upper()
+    if negative:
+        number = -number
+    if suffix in {"T", "TRILLION", "TRILLIONS"}:
+        unit = "USD trillions" if had_currency else "trillions"
+    elif suffix in {"B", "BN", "BILLION", "BILLIONS"}:
+        unit = "USD billions" if had_currency else "billions"
+    elif suffix in {"M", "MM", "MILLION", "MILLIONS"}:
+        unit = "USD millions" if had_currency else "millions"
+    elif suffix in {"K", "THOUSAND", "THOUSANDS"}:
+        unit = "USD thousands" if had_currency else "thousands"
+    elif "%" in suffix:
+        unit = "percent"
+    elif had_currency:
+        unit = "USD"
+    else:
+        unit = suffix
+    return number, unit
 
-    value_column = numeric_columns[0]
-    label_column = next((column for column in df.columns if column != value_column), None)
-    plot_data = df.dropna(subset=[value_column]).head(15)
-    if plot_data.empty:
-        return None
 
-    labels = plot_data[label_column].astype(str) if label_column else plot_data.index.astype(str)
-    is_time_series = label_column is not None and label_column.strip().lower() in ("period", "year", "date")
+def _chart_series(dataframe, query=""):
+    if dataframe.empty:
+        return None
+    metric_col = next((c for c in dataframe.columns if str(c).strip().lower() in {"metric", "measure", "indicator"}), None)
+    non_value_names = {"id", "index", "row", "year", "date", "period", "source", "publisher", "unit"}
+    candidates = []
+    for column in dataframe.columns:
+        if str(column).strip().lower() in non_value_names or column == metric_col:
+            continue
+        values = dataframe[column].map(lambda value: _chart_number(value)[0])
+        count = int(values.notna().sum())
+        if count:
+            requested = str(column).strip().lower() in str(query).lower()
+            candidates.append((requested, count, column, values))
+    if not candidates:
+        return None
+    _, _, value_col, values = max(candidates, key=lambda candidate: (candidate[0], candidate[1]))
+    plot_df = dataframe.copy()
+    plot_df["__chart_value"] = values
+    plot_df = plot_df[plot_df["__chart_value"].notna()]
+    metric = ""
+    if metric_col:
+        counts = plot_df[metric_col].astype(str).value_counts()
+        requested_metric = next((candidate for candidate in counts.index if candidate.lower() in str(query).lower()), None)
+        metric_candidates = ([requested_metric] if requested_metric else []) + [candidate for candidate in counts.index if candidate != requested_metric]
+        for candidate_metric in metric_candidates:
+            subset = plot_df[plot_df[metric_col].astype(str) == candidate_metric]
+            if len(subset) > 1:
+                plot_df, metric = subset, candidate_metric
+                break
+    plot_df = plot_df.head(15)
+    company_col = next((c for c in plot_df.columns if str(c).strip().lower() in {"company", "organization", "entity", "product"}), None)
+    category_col = next((c for c in plot_df.columns if str(c).strip().lower() in {"category", "region", "country", "market", "segment"}), None)
+    period_col = next((c for c in plot_df.columns if str(c).strip().lower() in {"period", "year", "date"}), None)
+    source_col = next((c for c in plot_df.columns if str(c).strip().lower() in {"source", "publisher"}), None)
+    label_col = company_col or category_col or period_col or source_col
+    labels = []
+    for index, row in plot_df.iterrows():
+        label = str(row[label_col]) if label_col else f"Record {index + 1}"
+        if company_col and period_col:
+            label = f"{row[company_col]} · {row[period_col]}"
+        elif period_col and source_col:
+            # Keep the publisher alongside the period when the dataset lacks an
+            # entity field, so equal-looking reporting periods remain identifiable.
+            publisher = str(row[source_col]).split("/")[0].strip()
+            publisher = publisher.replace(" Investor Relations", "").replace(" Filings", "")
+            period = str(row[period_col]).replace(" as of ", " ").split(" (ended")[0]
+            label = f"{publisher} · {period}"
+        elif company_col:
+            label = str(row[company_col])
+        labels.append(label[:60])
+    unit = ""
+    unit_col = next((c for c in dataframe.columns if str(c).strip().lower() == "unit"), None)
+    if unit_col:
+        units = plot_df[unit_col].dropna().astype(str).str.strip().unique()
+        if len(units) > 1:
+            return None
+        unit = units[0] if len(units) == 1 else ""
+    if not unit:
+        suffixes = [ _chart_number(value)[1] for value in plot_df[value_col] ]
+        if len(set(suffixes)) > 1:
+            return None
+        unit = suffixes[0] if suffixes else ""
+    category_title = ("company" if company_col else str(category_col).strip().lower() if category_col else
+                      "reporting period" if period_col else "source" if source_col else "record")
+    if period_col and source_col and not company_col:
+        category_title = "reporting period and source"
+    metric_title = metric or str(value_col).strip().title()
+    value_title = f"{metric_title} ({unit})" if unit else metric_title
+    title = f"{metric_title} by {category_title}"
+    if unit:
+        title += f" ({unit})"
+    time_series = bool(company_col and period_col and plot_df[company_col].nunique() == 1 and len(plot_df) >= 3)
+    chart_kind = "line" if time_series and any(word in str(query).lower() for word in ("trend", "over time", "time series")) else "bar"
+    if chart_kind == "line":
+        years = plot_df[period_col].astype(str).str.extract(r"(19\d{2}|20\d{2})", expand=False)
+        if years.isna().any() or years.duplicated().any():
+            chart_kind = "bar"
+        else:
+            order = years.astype(int).sort_values().index
+            plot_df = plot_df.loc[order]
+            labels = [f"{row[company_col]} · {row[period_col]}"[:60] for _, row in plot_df.iterrows()]
+    return {"labels": labels, "values": plot_df["__chart_value"].astype(float).tolist(), "title": title,
+            "value_title": value_title, "category_title": category_title, "kind": chart_kind}
+
+
+def chart(df, output_file="ai_chart.png", query=""):
+    """Create one focused chart using a comparable metric and explicit units."""
+    series = _chart_series(df, query)
+    if not series:
+        return None
+    labels, values = series["labels"], series["values"]
 
     plt.style.use("default")
     figure, axis = plt.subplots(figsize=(10, 5.5))
-    if is_time_series and len(plot_data) > 1:
-        axis.plot(labels, plot_data[value_column], color=f"#{NAVY}", marker="o", linewidth=2.5, markersize=6)
-        axis.fill_between(range(len(labels)), plot_data[value_column], color=f"#{NAVY}", alpha=0.08)
+    if series["kind"] == "line":
+        axis.plot(labels, values, color=f"#{TEAL}", marker="o", linewidth=2.5, markersize=6)
     else:
-        bars = axis.bar(labels, plot_data[value_column], color=f"#{TEAL}", edgecolor=f"#{NAVY}", linewidth=0.6)
-        axis.bar_label(bars, fmt="%.0f", padding=3, fontsize=9, color=f"#{NAVY}")
-
-    axis.set_title(f"{value_column} by {label_column or 'Row'}", fontsize=13, fontweight="bold", color=f"#{NAVY}")
-    axis.set_xlabel(label_column or "Row", fontsize=10)
-    axis.set_ylabel(value_column, fontsize=10)
+        bars = axis.bar(labels, values, color=f"#{TEAL}", edgecolor=f"#{NAVY}", linewidth=0.6)
+        value_labels = [f"{value:,.1f}" if abs(value) < 1000 else f"{value:,.0f}" for value in values]
+        axis.bar_label(bars, labels=value_labels, padding=3, fontsize=9, color=f"#{NAVY}")
+        if min(values) >= 0:
+            axis.set_ylim(bottom=0)
+    axis.set_title(series["title"], fontsize=13, fontweight="bold", color=f"#{NAVY}")
+    axis.set_xlabel(series["category_title"].title(), fontsize=10)
+    axis.set_ylabel(series["value_title"], fontsize=10)
     axis.tick_params(axis="x", rotation=40, labelsize=9)
     axis.spines["top"].set_visible(False)
     axis.spines["right"].set_visible(False)
@@ -210,6 +359,86 @@ def style_overview_sheet(overview, summary, query, row_count):
     overview.merge_cells("B8:H8")
 
 
+def add_excel_chart(workbook, overview, dataframe, query=""):
+    """Add an editable native Excel bar chart when the data has numeric values."""
+    series = _chart_series(dataframe, query)
+    if not series:
+        return False
+    chart_data = workbook.create_sheet("Chart Data")
+    chart_data.append(["Category", series["title"]])
+    for label, value in zip(series["labels"], series["values"]):
+        chart_data.append([label, value])
+    chart_data.sheet_state = "hidden"
+
+    chart = LineChart() if series["kind"] == "line" else BarChart()
+    if isinstance(chart, BarChart) and min(series["values"]) >= 0:
+        chart.type = "col"
+        chart.y_axis.scaling.min = 0
+    elif isinstance(chart, BarChart):
+        chart.type = "col"
+    chart.style = 10
+    chart.title = series["title"]
+    chart.x_axis.title = series["category_title"].title()
+    chart.y_axis.title = series["value_title"]
+    chart.height = 8
+    chart.width = 16
+    chart.legend = None
+    if isinstance(chart, BarChart):
+        chart.dLbls = DataLabelList()
+        chart.dLbls.showVal = True
+    data = Reference(chart_data, min_col=2, min_row=1, max_row=chart_data.max_row)
+    categories = Reference(chart_data, min_col=1, min_row=2, max_row=chart_data.max_row)
+    chart.add_data(data, titles_from_data=True)
+    chart.set_categories(categories)
+    overview.add_chart(chart, "B11")
+    return True
+
+
+def add_workbook_chart(excel_file, dataframe, query="", identifier="local"):
+    """Add an editable chart on a new sheet while preserving uploaded workbook sheets."""
+    series = _chart_series(dataframe, query)
+    if not series:
+        return False
+    workbook = load_workbook(excel_file)
+    suffix = re.sub(r"[^a-zA-Z0-9]", "", str(identifier))[:8] or "local"
+    chart_name = f"MP Chart {suffix}"
+    data_name = f"MP Data {suffix}"
+    for sheet_name in (chart_name, data_name):
+        if sheet_name in workbook.sheetnames:
+            del workbook[sheet_name]
+
+    chart_data = workbook.create_sheet(data_name)
+    chart_data.append(["Category", series["title"]])
+    for label, value in zip(series["labels"], series["values"]):
+        chart_data.append([label, value])
+    chart_data.sheet_state = "hidden"
+
+    chart_sheet = workbook.create_sheet(chart_name)
+    chart_sheet.sheet_view.showGridLines = False
+    chart_sheet.sheet_properties.tabColor = TEAL
+    excel_chart = LineChart() if series["kind"] == "line" else BarChart()
+    if isinstance(excel_chart, BarChart):
+        excel_chart.type = "col"
+        if min(series["values"]) >= 0:
+            excel_chart.y_axis.scaling.min = 0
+        excel_chart.dLbls = DataLabelList()
+        excel_chart.dLbls.showVal = True
+    excel_chart.style = 10
+    excel_chart.title = series["title"]
+    excel_chart.x_axis.title = series["category_title"].title()
+    excel_chart.y_axis.title = series["value_title"]
+    excel_chart.height = 12
+    excel_chart.width = 22
+    excel_chart.legend = None
+    data = Reference(chart_data, min_col=2, min_row=1, max_row=chart_data.max_row)
+    categories = Reference(chart_data, min_col=1, min_row=2, max_row=chart_data.max_row)
+    excel_chart.add_data(data, titles_from_data=True)
+    excel_chart.set_categories(categories)
+    chart_sheet.add_chart(excel_chart, "A1")
+    workbook.save(excel_file)
+    return True
+
+
 def style_source_sheet(source_sheet, sources):
     """Present sources as a bordered, numbered list rather than a plain column."""
     source_sheet.sheet_view.showGridLines = False
@@ -237,15 +466,19 @@ def style_source_sheet(source_sheet, sources):
         source_sheet.append(["", "No sources were returned for this request."])
 
 
-def export_research(df, excel_file="ai_table.xlsx", summary="", sources=None, query=""):
-    chart_file = chart(df)
-    df.to_excel(excel_file, index=False, sheet_name="Research Data", engine="openpyxl")
-    workbook = load_workbook(excel_file)
+def export_research(df, excel_file="ai_table.xlsx", summary="", sources=None, query="", chart_query=None):
+    excel_path = Path(excel_file)
+    excel_path.parent.mkdir(parents=True, exist_ok=True)
+    chart_query = query if chart_query is None else chart_query
+    chart_file = chart(df, output_file=str(excel_path.with_name("ai_chart.png")), query=chart_query)
+    df.to_excel(excel_path, index=False, sheet_name="Research Data", engine="openpyxl")
+    workbook = load_workbook(excel_path)
     worksheet = workbook["Research Data"]
     style_data_sheet(worksheet)
 
     overview = workbook.create_sheet("Overview", 0)
     style_overview_sheet(overview, summary, query, len(df))
+    add_excel_chart(workbook, overview, df, chart_query)
 
     source_sheet = workbook.create_sheet("Sources")
     style_source_sheet(source_sheet, sources)
@@ -256,8 +489,8 @@ def export_research(df, excel_file="ai_table.xlsx", summary="", sources=None, qu
     workbook.properties.title = query or "Research Analysis"
     workbook.properties.creator = "Multipanel"
     workbook.active = 0
-    workbook.save(excel_file)
-    return excel_file
+    workbook.save(excel_path)
+    return excel_path
 
 
 if __name__ == "__main__":

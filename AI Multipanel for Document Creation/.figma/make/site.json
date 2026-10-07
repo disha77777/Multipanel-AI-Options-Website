@@ -1,0 +1,11 @@
+{
+  "title": "Multipanel AI — Your research and creation workspace",
+  "description": "Research, plan, create presentations, build spreadsheets, clean data, and extract tables in one AI-assisted workspace.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}

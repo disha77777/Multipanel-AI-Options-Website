@@ -1,8 +1,12 @@
+fastapi
+certifi
 google-genai
 matplotlib
 openpyxl
 pandas
 Pillow
 python-dateutil
+python-multipart
 python-pptx
 streamlit
+uvicorn
