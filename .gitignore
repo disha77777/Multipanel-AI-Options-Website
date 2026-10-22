@@ -18,3 +18,4 @@ ocr_output.csv
 # Python cache
 __pycache__/
 *.pyc
+.streamlit/secrets.toml

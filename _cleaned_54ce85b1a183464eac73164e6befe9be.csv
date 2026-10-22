@@ -1,0 +1,6 @@
+name,email,amount,region,date
+Alice,alice@example.com,100.5,North,2024-01-15
+Bob,bob@example.com,200.0,South,2024-02-20
+charlie,charlie@example.com,,North,2024-01-15
+Alice,alice@example.com,100.5,North,2024-03-10
+Dave,,50.25,East,2024-02-20
