@@ -541,3 +541,24 @@ def download_extraction(fmt: str):
 def health():
     providers = configured_providers()
     return {"status": "ok", "ai_configured": any(providers.values()), "providers": providers}
+
+
+FRONTEND_DIST_DIR = BASE_DIR / "AI Multipanel for Document Creation" / "dist"
+
+
+@app.get("/", include_in_schema=False)
+@app.get("/{path:path}", include_in_schema=False)
+def serve_frontend(path: str = ""):
+    frontend_root = FRONTEND_DIST_DIR.resolve()
+    index_file = frontend_root / "index.html"
+    if not index_file.is_file():
+        raise HTTPException(404, "Frontend assets are not available.")
+
+    requested_file = (frontend_root / path).resolve()
+    if not requested_file.is_relative_to(frontend_root):
+        raise HTTPException(404, "Not found.")
+    if requested_file.is_file():
+        return FileResponse(requested_file)
+    if path == "api" or path.startswith("api/") or Path(path).suffix:
+        raise HTTPException(404, "Not found.")
+    return FileResponse(index_file)

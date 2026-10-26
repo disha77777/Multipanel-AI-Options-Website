@@ -1,0 +1,16 @@
+.git
+.venv/
+**/__pycache__/
+*.py[cod]
+.env
+.env.*
+key.env
+**/node_modules/
+AI Multipanel for Document Creation/dist/
+app.py
+chem.py
+api/
+pinkman/
+pinkman-*.html
+pinkman_server.py
+login.sql

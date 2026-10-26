@@ -1,36 +1,14 @@
 services:
   - type: web
-    name: multipanel-api
-    runtime: python
+    name: multipanel
+    runtime: docker
     plan: free
     region: oregon
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn api_server:app --host 0.0.0.0 --port $PORT
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
     healthCheckPath: /api/health
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.12.0
       - key: GEMINI_API_KEY
         sync: false
       - key: XAI_API_KEY
         sync: false
-      - key: ALLOWED_ORIGINS
-        fromService:
-          type: web
-          name: multipanel-ui
-          envVarKey: RENDER_EXTERNAL_URL
-
-  - type: web
-    name: multipanel-ui
-    runtime: static
-    rootDir: AI Multipanel for Document Creation
-    buildCommand: corepack pnpm@9.15.9 install --frozen-lockfile && corepack pnpm@9.15.9 run build
-    staticPublishPath: dist
-    envVars:
-      - key: NODE_VERSION
-        value: 22.12.0
-      - key: VITE_API_BASE_URL
-        fromService:
-          type: web
-          name: multipanel-api
-          envVarKey: RENDER_EXTERNAL_URL

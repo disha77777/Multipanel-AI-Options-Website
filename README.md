@@ -1,6 +1,6 @@
 # Multipanel AI
 
-Multipanel AI is a Streamlit workspace for AI-assisted research, Excel reports, presentation generation, image-table OCR, and data cleaning. It previews generated artifacts in the browser before download.
+Multipanel AI is an AI workspace for research, Excel reports, presentation generation, image-table OCR, and data cleaning. Its React interface and Python API run together as one production service, with generated artifacts previewed in the browser before download.
 
 ## Features
 
@@ -10,7 +10,7 @@ Multipanel AI is a Streamlit workspace for AI-assisted research, Excel reports, 
 - Create a research plan or a source-backed verified research report.
 - Upload CSV or Excel data and apply natural-language cleaning operations.
 
-## Setup
+## Local setup
 
 Use Python 3.12, then install the dependencies:
 
@@ -25,49 +25,44 @@ GEMINI_API_KEY=your_gemini_api_key
 XAI_API_KEY=your_xai_api_key
 ```
 
-Run the app:
+Use the React UI and Python API workflow below for the same interface as the combined production service.
 
-```bash
-streamlit run app.py
-```
+## React UI and Python API
 
-Open the URL printed by Streamlit, usually `http://localhost:8501`.
-
-## React UI with the Python API
-
-The React interface in [`AI Multipanel for Document Creation`](AI%20Multipanel%20for%20Document%20Creation) uses `api_server.py`. Run both services during development:
+The React interface in [`AI Multipanel for Document Creation`](AI%20Multipanel%20for%20Document%20Creation) uses `api_server.py`. During development, run the API:
 
 ```bash
 python3 -m pip install -r requirements.txt
 uvicorn api_server:app --reload --port 8000
 ```
 
-In a second terminal:
+In a second terminal, run the React dev server:
 
 ```bash
 cd "AI Multipanel for Document Creation"
-npm install
-npm run dev
+corepack pnpm@9.15.9 install --frozen-lockfile
+corepack pnpm@9.15.9 run dev
 ```
 
-Vite proxies `/api` to `http://127.0.0.1:8000` by default. Set `API_PROXY_TARGET` if the API runs elsewhere. For separately hosted production UI and API, set `VITE_API_BASE_URL` to the API origin when building the UI and set `ALLOWED_ORIGINS` on the API to the exact deployed UI origin(s), comma-separated. The UI checks `/api/health` and reports whether its backend is reachable.
+Vite proxies `/api` to `http://127.0.0.1:8000` by default. Set `API_PROXY_TARGET` if the API runs elsewhere. The UI uses same-origin `/api` requests in production and checks `/api/health` to report whether its backend is reachable.
 
-## Deploy the React UI and API to Render
+## Deploy the combined app to Render
 
-The root [`render.yaml`](render.yaml) Blueprint defines a free static UI and a free Python API. It derives `VITE_API_BASE_URL` and the API's exact `ALLOWED_ORIGINS` from the two Render service URLs. The API health check is `/api/health`.
+The root [`render.yaml`](render.yaml) Blueprint defines one free Docker web service. The multi-stage [`Dockerfile`](Dockerfile) builds the React UI and packages it with the FastAPI backend; FastAPI serves both the UI and `/api` from the same origin. The health check is `/api/health`.
 
-1. Push the branch containing `render.yaml` and the app code to a GitHub repository connected to Render.
-2. In Render, choose **New > Blueprint**, select that repository and branch, and review the two services.
-3. Enter `GEMINI_API_KEY` and/or `XAI_API_KEY` in Render's secret prompt. At least one provider key is needed for AI generation; never put real keys in this file or commit them.
-4. Deploy, then confirm the API service's `/api/health` reports `status: ok` and the configured provider(s).
+1. Push the branch containing `render.yaml`, `Dockerfile`, and the app code to the GitHub repository connected to Render.
+2. In Render, choose **New > Blueprint**, select that repository and branch, and review the single `multipanel` web service.
+3. Enter `GEMINI_API_KEY` and/or `XAI_API_KEY` in Render's secret prompt. At least one provider key is needed for AI generation; never put real keys in the Docker image or commit them.
+4. Deploy, then confirm the service's `/api/health` reports `status: ok` and the configured provider(s). The root URL serves the React UI and the API is available under `/api`.
 
-The free API service can sleep when idle, and its in-memory sessions and generated files are not durable. This setup is suitable for a low-cost demo, not persistent multi-user data. If you add a custom UI domain, update the API's `ALLOWED_ORIGINS` to include that exact `https://` origin.
+The free service can sleep when idle, and its in-memory sessions and generated files are not durable. This setup is suitable for a low-cost demo, not persistent multi-user data.
+If the previous two-service Blueprint is already deployed, verify the new service before removing the old `multipanel-ui` and `multipanel-api` services. Streamlit Community Cloud remains a separate deployment; use the new Render URL for the combined app.
 
-## Release deployment
+## Alternative deployments
 
-### Streamlit app
+### Standalone Streamlit version
 
-Deploy this repository using Streamlit Community Cloud with `app.py` as the main file. Add `GEMINI_API_KEY` under **Settings > Secrets** using TOML syntax:
+The root `app.py` is a separate Streamlit interface; it is not used by the combined Render service. To keep using it independently, deploy this repository using Streamlit Community Cloud with `app.py` as the main file. Add `GEMINI_API_KEY` under **Settings > Secrets** using TOML syntax:
 
 ```toml
 GEMINI_API_KEY = "your_gemini_api_key"
@@ -75,7 +70,7 @@ GEMINI_API_KEY = "your_gemini_api_key"
 
 Do not commit `.env`, `key.env`, or Streamlit secrets.
 
-### Chemistry API
+### Separate chemistry API
 
 The optional chemistry chat frontend/API is deployed separately through the existing Vercel configuration. Set `GEMINI_API_KEY` in the Vercel project environment, then deploy from the repository root. Verify the deployment with `/api/health` before sharing it.
 
@@ -84,9 +79,7 @@ The API limits uploads to 8 MB, accepts JPEG/PNG/WebP images, rate-limits reques
 ## Release checks
 
 ```bash
-python3 -m compileall -q app.py api chem.py datacleaner.py excel.py presentation.py reader.py research_assistant.py research_planner.py
-python3 -m pip install -r requirements.txt
-streamlit run app.py
+docker build -t multipanel .
 ```
 
 The `.env` file is ignored by Git and must not be committed.
@@ -100,7 +93,7 @@ This MVP implements the application-layer controls below:
 3. **WAF:** place Vercel WAF, Cloudflare, or your cloud edge firewall in front of the API. Enforce managed OWASP rules, bot protection, request-size limits, and country/IP policy at the edge. A response header cannot replace a WAF.
 4. **Rate limiting:** the chemistry API uses configurable per-IP limits. For multiple serverless instances, add a distributed limiter at the edge (for example, a provider-native rate-limit product) because in-memory counters are instance-local.
 5. **Input validation:** question length, image MIME type, image decoding, image dimensions, structured mechanism output, source URLs, citations, and data-cleaning operations are validated before use.
-6. **CORS:** set `ALLOWED_ORIGINS` to exact origins such as `https://your-app.example`; do not use `*`. The API rejects unconfigured browser origins.
+6. **CORS:** the combined production UI and API are same-origin, so browser CORS is not needed. If you host them on separate origins, set `ALLOWED_ORIGINS` to exact origins such as `https://your-app.example`; do not use `*`.
 7. **Configuration and flags:** use environment variables for limits and `ENABLE_CHEMISTRY` / `ENABLE_LIVE_RESEARCH` for emergency feature shutdowns. Keep production and development environments separate.
 8. **Prompt injection:** model prompts delimit user content as untrusted data, reject unsupported structured operations, validate generated JSON, and instruct models not to reveal system prompts or secrets. This reduces risk but cannot guarantee model immunity.
 
