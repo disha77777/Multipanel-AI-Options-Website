@@ -39,15 +39,29 @@ function postJson<T>(path: string, payload: unknown): Promise<T> {
 // ─── Presentation Studio ──────────────────────────────────────────────────────
 
 export interface SlideVisual { type: 'process' | 'cycle' | 'comparison'; items: { label: string; detail: string }[]; image_query?: string }
-export interface SlideImage { url: string; file_page_url: string; artist: string; license: string; license_url?: string; file_name?: string }
+export interface SlideImage {
+  url?: string
+  file_page_url?: string
+  artist?: string
+  license: string
+  license_url?: string
+  file_name?: string
+  kind?: 'report_chart'
+  data?: string
+  chart_title?: string
+  report_title?: string
+  publisher?: string
+  page_number?: number
+  source_url?: string
+}
 export interface Slide { title: string; bullets: string[]; visual?: SlideVisual | null; image?: SlideImage }
-export interface PresentationInfo { title: string; slides: Slide[] }
+export interface PresentationInfo { title: string; slides: Slide[]; chart_notice?: string }
 
-export const createPresentation = (topic: string, slideCount = 6, audience = 'general audience', tone = 'clear and persuasive', provider: AIProvider = 'grok', style = 'Editorial', includeWebImages = false) =>
-  postJson<PresentationInfo>('/api/presentation', { topic, slide_count: slideCount, audience, tone, provider, style, include_web_images: includeWebImages })
+export const createPresentation = (topic: string, slideCount = 6, audience = 'general audience', tone = 'clear and persuasive', provider: AIProvider = 'grok', style = 'Editorial', includeReportCharts = false) =>
+  postJson<PresentationInfo>('/api/presentation', { topic, slide_count: slideCount, audience, tone, provider, style, include_report_charts: includeReportCharts })
 
-export const refinePresentation = (presentationInfo: PresentationInfo, revision: string, provider: AIProvider = 'grok', style = 'Editorial', includeWebImages = false) =>
-  postJson<PresentationInfo>('/api/presentation/refine', { presentation: presentationInfo, revision, provider, style, include_web_images: includeWebImages })
+export const refinePresentation = (presentationInfo: PresentationInfo, revision: string, provider: AIProvider = 'grok', style = 'Editorial', includeReportCharts = false) =>
+  postJson<PresentationInfo>('/api/presentation/refine', { presentation: presentationInfo, revision, provider, style, include_report_charts: includeReportCharts })
 
 export const presentationExportUrl = () => `${API_BASE}/api/presentation/export`
 

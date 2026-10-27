@@ -129,6 +129,7 @@ class PresentationRequest(BaseModel):
     provider: str = Field(default="grok", max_length=20)
     style: str = Field(default="Editorial", max_length=40)
     include_web_images: bool = False
+    include_report_charts: bool = False
 
 
 class PresentationRefineRequest(BaseModel):
@@ -137,6 +138,7 @@ class PresentationRefineRequest(BaseModel):
     provider: str = Field(default="grok", max_length=20)
     style: str = Field(default="Editorial", max_length=40)
     include_web_images: bool = False
+    include_report_charts: bool = False
 
 
 @app.post("/api/presentation")
@@ -152,6 +154,7 @@ def create_presentation(payload: PresentationRequest):
             provider=payload.provider,
             style=payload.style,
             include_web_images=payload.include_web_images,
+            include_report_charts=payload.include_report_charts,
         )
     except Exception as error:
         raise HTTPException(502, friendly_error(error)) from error
@@ -163,6 +166,7 @@ def refine_presentation_endpoint(payload: PresentationRefineRequest):
         return refine_presentation(
             payload.presentation, payload.revision, provider=payload.provider,
             style=payload.style, include_web_images=payload.include_web_images,
+            include_report_charts=payload.include_report_charts,
         )
     except Exception as error:
         raise HTTPException(502, friendly_error(error)) from error

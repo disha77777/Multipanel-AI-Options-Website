@@ -46,6 +46,8 @@ corepack pnpm@9.15.9 run dev
 
 Vite proxies `/api` to `http://127.0.0.1:8000` by default. Set `API_PROXY_TARGET` if the API runs elsewhere. The UI uses same-origin `/api` requests in production and checks `/api/health` to report whether its backend is reachable.
 
+In Presentation Studio, enable **Report charts** to search for relevant figures in reports that explicitly permit reuse. The app extracts a chart from the cited PDF page and includes source, page, and license attribution in the slide. Search and chart detection use the selected AI provider and may add several model calls. If no reusable chart can be verified, the deck is still generated with a notice.
+
 ## Deploy the combined app to Render
 
 The root [`render.yaml`](render.yaml) Blueprint defines one free Docker web service. The multi-stage [`Dockerfile`](Dockerfile) builds the React UI and packages it with the FastAPI backend; FastAPI serves both the UI and `/api` from the same origin. The health check is `/api/health`.

@@ -144,7 +144,7 @@ function DiagramPreview({ visual, theme }: { visual: NonNullable<PresentationInf
   </div>
 }
 
-function PresentationPanel({ data, onUpload, styleName, onStyleChange, includeWebImages, onToggleWebImages }: { data: PresentationInfo | null; onUpload: (file: File) => void; styleName: keyof typeof presentationThemes; onStyleChange: (name: keyof typeof presentationThemes) => void; includeWebImages: boolean; onToggleWebImages: () => void }) {
+function PresentationPanel({ data, onUpload, styleName, onStyleChange, includeReportCharts, onToggleReportCharts }: { data: PresentationInfo | null; onUpload: (file: File) => void; styleName: keyof typeof presentationThemes; onStyleChange: (name: keyof typeof presentationThemes) => void; includeReportCharts: boolean; onToggleReportCharts: () => void }) {
   const [active, setActive] = useState(0)
   const [animateSlides, setAnimateSlides] = useState(true)
   const [exporting, setExporting] = useState(false)
@@ -211,8 +211,8 @@ function PresentationPanel({ data, onUpload, styleName, onStyleChange, includeWe
                 {Object.keys(presentationThemes).map(name => <option key={name}>{name}</option>)}
               </select>
             </label>
-            <button onClick={onToggleWebImages} aria-pressed={includeWebImages} className="px-2.5 py-1 rounded text-xs transition-colors" style={{ color:includeWebImages ? 'var(--c-ppt)' : 'var(--muted-fg)', background:'var(--secondary)', border:'1px solid var(--border)' }}>
-              Web images: {includeWebImages ? 'On' : 'Off'}
+            <button onClick={onToggleReportCharts} aria-pressed={includeReportCharts} title="Find and cite openly licensed charts in relevant online reports" className="px-2.5 py-1 rounded text-xs transition-colors" style={{ color:includeReportCharts ? 'var(--c-ppt)' : 'var(--muted-fg)', background:'var(--secondary)', border:'1px solid var(--border)' }}>
+              Report charts: {includeReportCharts ? 'On' : 'Off'}
             </button>
             <button onClick={()=>setAnimateSlides(value=>!value)} aria-pressed={animateSlides} className="px-2.5 py-1 rounded text-xs transition-colors" style={{ color: animateSlides ? 'var(--c-ppt)' : 'var(--muted-fg)', background:'var(--secondary)', border:'1px solid var(--border)' }}>
               Animate: {animateSlides ? 'On' : 'Off'}
@@ -274,9 +274,15 @@ function PresentationPanel({ data, onUpload, styleName, onStyleChange, includeWe
                     {(s.visual || s.image) && <div className="flex min-w-0 flex-1 flex-col gap-2">
                       {s.visual && <DiagramPreview visual={s.visual} theme={theme} />}
                       {s.image && <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg border" style={{ borderColor:theme.accent2 }}>
-                        <img src={s.image.url} alt={s.title} className="min-h-0 flex-1 object-cover" />
-                        <a href={s.image.file_page_url} target="_blank" rel="noreferrer" className="block truncate px-1.5 py-1 text-[7px]" style={{ color:theme.muted }}>
-                          Photo: {s.image.artist} · {s.image.license} · Wikimedia Commons
+                        <img
+                          src={s.image.data ? `data:image/jpeg;base64,${s.image.data}` : s.image.url}
+                          alt={s.image.chart_title || s.title}
+                          className={`min-h-0 flex-1 ${s.image.kind === 'report_chart' ? 'object-contain bg-white' : 'object-cover'}`}
+                        />
+                        <a href={s.image.source_url || s.image.file_page_url} target="_blank" rel="noreferrer" className="block truncate px-1.5 py-1 text-[7px]" style={{ color:theme.muted }}>
+                          {s.image.kind === 'report_chart'
+                            ? `Chart: ${s.image.report_title} · ${s.image.publisher} · p. ${s.image.page_number} · ${s.image.license}`
+                            : `Photo: ${s.image.artist} · ${s.image.license} · Wikimedia Commons`}
                         </a>
                       </div>}
                     </div>}
@@ -1092,7 +1098,7 @@ export default function App() {
     const saved = window.localStorage.getItem('multipanel-presentation-style')
     return saved && saved in presentationThemes ? saved as keyof typeof presentationThemes : 'Editorial'
   })
-  const [includeWebImages, setIncludeWebImages] = useState(false)
+  const [includeReportCharts, setIncludeReportCharts] = useState(false)
   const [uiError, setUiError] = useState('')
 
   const runUpload = async <T,>(operation: () => Promise<T>, apply: (result: T) => void) => {
@@ -1122,13 +1128,15 @@ export default function App() {
     switch (currentMode) {
       case 'presentation': {
         if (!presentationResult) {
-          const result = await createPresentation(text, 6, 'general audience', 'clear and persuasive', provider, presentationStyle, includeWebImages)
+          const result = await createPresentation(text, 6, 'general audience', 'clear and persuasive', provider, presentationStyle, includeReportCharts)
           setPresentationResult(result)
-          return `Drafted "${result.title}" with ${result.slides.length} slides. Open the canvas to review, then ask me for changes.`
+          const chartNotice = result.chart_notice ? ` ${result.chart_notice}` : ''
+          return `Drafted "${result.title}" with ${result.slides.length} slides. Open the canvas to review, then ask me for changes.${chartNotice}`
         }
-        const revised = await refinePresentation(presentationResult, text, provider, presentationStyle, includeWebImages)
+        const revised = await refinePresentation(presentationResult, text, provider, presentationStyle, includeReportCharts)
         setPresentationResult(revised)
-        return `Updated the deck: "${revised.title}" now has ${revised.slides.length} slides.`
+        const chartNotice = revised.chart_notice ? ` ${revised.chart_notice}` : ''
+        return `Updated the deck: "${revised.title}" now has ${revised.slides.length} slides.${chartNotice}`
       }
       case 'excel': {
         if (excelResult && /\b(chart|graph|plot|visuali[sz]e)\b/i.test(text)) {
@@ -1233,7 +1241,7 @@ export default function App() {
       ) : (
         <main className="app-workspace-main flex-1 flex overflow-hidden p-4">
           <div className="workspace-main-panel flex-1 overflow-hidden rounded-[22px] border" style={{ background:'linear-gradient(160deg,#0d141c 0%,#0a0f15 100%)', borderColor:'var(--border)', minWidth:0, boxShadow:'0 20px 50px rgba(0,0,0,0.28)' }}>
-            {mode==='presentation' && <PresentationPanel data={presentationResult} onUpload={file => runUpload(() => uploadPresentationFile(file), setPresentationResult)} styleName={presentationStyle} onStyleChange={setPresentationStyle} includeWebImages={includeWebImages} onToggleWebImages={()=>setIncludeWebImages(value=>!value)}/>}
+            {mode==='presentation' && <PresentationPanel data={presentationResult} onUpload={file => runUpload(() => uploadPresentationFile(file), setPresentationResult)} styleName={presentationStyle} onStyleChange={setPresentationStyle} includeReportCharts={includeReportCharts} onToggleReportCharts={()=>setIncludeReportCharts(value=>!value)}/>}
             {mode==='excel'        && <ExcelPanel data={excelResult} onUpload={file => runUpload(() => uploadExcelFile(file), setExcelResult)}/>}
             {mode==='research'     && <ResearchPanel data={researchReport} onAsk={async question => setResearchReport(await createVerifiedResearch(question, 'latest available', 'credible primary sources', provider))}/>}
             {mode==='cleaner'      && <CleanerPanel session={cleanerSession} onUpload={file => runUpload(() => uploadCleanerFile(file), setCleanerSession)}/>}

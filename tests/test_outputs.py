@@ -1,3 +1,4 @@
+import base64
 import json
 import inspect
 import io
@@ -15,6 +16,7 @@ from pptx import Presentation
 import datacleaner
 import excel
 import presentation
+import presentation_media
 import reader
 import research_assistant
 import research_planner
@@ -72,6 +74,21 @@ VERIFIED_REPORT = {
 
 
 class OutputTests(unittest.TestCase):
+    @patch("presentation_media.generate_text", return_value='{"found":true,"x0":100,"y0":100,"x1":800,"y1":700}')
+    def test_report_chart_crop_uses_detected_chart_bounds(self, _generate_text):
+        page_image = Image.new("RGB", (600, 400), color="white")
+        encoded = presentation_media._find_chart_crop(
+            page_image,
+            chart_title="Annual growth",
+            provider="gemini",
+        )
+        cropped = Image.open(io.BytesIO(base64.b64decode(encoded)))
+        self.assertEqual(cropped.size, (420, 240))
+
+    def test_report_chart_fetch_rejects_local_network_urls(self):
+        with self.assertRaisesRegex(ValueError, "public IP"):
+            presentation_media._validate_public_https_url("https://127.0.0.1/report.pdf")
+
     def test_presentation_file_contains_slide_copy(self):
         deck = {
             "title": "Remote work",
@@ -87,6 +104,35 @@ class OutputTests(unittest.TestCase):
             self.assertEqual(loaded.slides[0].shapes.title.text, "Opening")
             self.assertIn("Outcome-based management", loaded.slides[0].placeholders[1].text)
             self.assertIn("Measured output rose", loaded.slides[1].placeholders[1].text)
+
+    def test_presentation_embeds_and_attributes_report_chart(self):
+        image_buffer = io.BytesIO()
+        Image.new("RGB", (240, 120), color="white").save(image_buffer, format="JPEG")
+        deck = {
+            "title": "Energy report",
+            "slides": [{
+                "title": "Renewable capacity",
+                "bullets": ["Capacity increased in 2024."],
+                "image": {
+                    "kind": "report_chart",
+                    "data": base64.b64encode(image_buffer.getvalue()).decode("ascii"),
+                    "chart_title": "Renewable capacity additions",
+                    "report_title": "Global Energy Review",
+                    "publisher": "Example Institute",
+                    "page_number": 12,
+                    "source_url": "https://example.com/report.pdf",
+                    "license": "CC BY 4.0",
+                },
+            }],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = presentation.presentation(deck, Path(tmp) / "report.pptx")
+            loaded = Presentation(path)
+            slide = loaded.slides[0]
+            self.assertEqual(len(slide.shapes._spTree.xpath(".//p:pic")), 1)
+            source_box = next(shape for shape in slide.shapes if getattr(shape, "has_text_frame", False) and "Renewable capacity additions" in shape.text)
+            self.assertIn("p. 12", source_box.text)
+            self.assertEqual(source_box.text_frame.paragraphs[0].runs[0].hyperlink.address, "https://example.com/report.pdf")
 
     def test_excel_workbook_has_overview_data_sources_and_chart(self):
         summary, sources, dataframe = excel.parse_research_response(SAMPLE_RESEARCH)

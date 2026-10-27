@@ -8,5 +8,7 @@ Pillow
 python-dateutil
 python-multipart
 python-pptx
+pypdf>=5,<7
+pypdfium2>=4.30,<6
 streamlit
 uvicorn
