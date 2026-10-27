@@ -1,7 +1,7 @@
 FROM node:22.12.0-bookworm-slim AS frontend-build
 
 WORKDIR /frontend
-RUN corepack enable && corepack prepare pnpm@9.15.9 --activate
+RUN npm install --global pnpm@9.15.9
 COPY ["AI Multipanel for Document Creation/package.json", "AI Multipanel for Document Creation/pnpm-lock.yaml", "./"]
 RUN pnpm install --frozen-lockfile
 COPY ["AI Multipanel for Document Creation/", "./"]
